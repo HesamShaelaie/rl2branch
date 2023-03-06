@@ -4,6 +4,7 @@
 # transfer.                                                                     #
 # Usage:                                                                        #
 # python 01_generate_instances.py <type> -s <seed>                              #
+# python 01_generate_instances.py mknapsack -s 2                                #
 # * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * #
 
 import os

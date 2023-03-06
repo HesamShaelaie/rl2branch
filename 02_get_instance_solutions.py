@@ -3,6 +3,7 @@
 # before training.                                                              #                                                                     #
 # Usage:                                                                        #
 # python 02_get_instance_solutions.py <type> -j <njobs> -n <ninstances>         #
+# python 02_get_instance_solutions.py mknapsack -j 8 -n 2                       #
 # * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * #
 
 import glob
@@ -11,8 +12,14 @@ import sys
 import argparse
 import threading
 import queue
-
 import ecole
+
+def PreRunCodes(args):
+    
+
+
+
+
 
 class OptimalSol:
     def __init__(self):
@@ -43,34 +50,39 @@ def solve_instance(in_queue, out_queue):
         instance = in_queue.get()
         env = ecole.environment.Configuring( scip_params={},
                                              observation_function=None,
-                                             reward_function=reward_fun )
+                                             reward_function=reward_fun)
         env.reset(str(instance))
         print(f'Solving {instance}')
         _, _, solution, _, _ = env.step({})
         out_queue.put({instance: solution})
 
-
-
 if __name__ == '__main__':
+
+
+
     parser = argparse.ArgumentParser()
     parser.add_argument(
         'problem',
         help='MILP instance type to process.',
         choices=['setcover', 'cauctions', 'ufacilities', 'indset', 'mknapsack'],
     )
+
     parser.add_argument(
         '-j', '--njobs',
         help='Number of parallel jobs.',
         type=int,
         default=1,
     )
+
     parser.add_argument(
         '-n', '--ninst',
         help='Number of instances to solve.',
         type=int,
         default=10000,
     )
+
     args = parser.parse_args()
+
 
     if args.problem == 'setcover':
         instance_dir = 'data/instances/setcover/train_400r_750c_0.05d'
@@ -89,8 +101,20 @@ if __name__ == '__main__':
         instances = glob.glob(instance_dir + '/*.lp')
     else:
         raise NotImplementedError
-
+    # instances is just a list
+    # glob.glob returns the list by random it is not sorted
+    
     num_inst = min(args.ninst,len(instances))
+
+    """
+    instances.sort()
+    
+    print("=======   test   ===========")
+    for x in range(num_inst):
+        print(instances[x])
+    print("============================")
+    """
+    
     orders_queue = queue.Queue()
     answers_queue = queue.Queue()
     for instance in instances[:num_inst]:
@@ -104,7 +128,7 @@ if __name__ == '__main__':
                 args=(orders_queue, answers_queue),
                 daemon=True)
         workers.append(p)
-        p.start()
+        p.start()    
 
     i = 0
     solutions = {}

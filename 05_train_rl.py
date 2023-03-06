@@ -40,12 +40,14 @@ if __name__ == '__main__':
         help='Training mode.',
         choices=['mdp', 'tmdp+DFS', 'tmdp+ObjLim'],
     )
+    
     parser.add_argument(
         '--wandb',
         help="Use wandb?",
         default=False,
         action="store_true",
     )
+
     # add all config parameters as optional command-line arguments
     for param, value in config.items():
         if param == 'gpu':
@@ -156,16 +158,27 @@ if __name__ == '__main__':
         while True:
             yield [{'path': instance, 'sol': train_sols[instance] + eps, 'seed': rng.randint(0, 2**32)}
                     for instance in rng.choice(train_instances, size=config['num_episodes_per_epoch'], replace=True)]
+    # number of episodes per epoch    
+    # Also, this allows to have the possibility of using one instance multiple times
 
     train_batches = train_batch_generator()
 
     logger.info(f"Training on {len(train_instances)} training instances and {len(valid_instances)} validation instances")
 
 
+    #brain = Brain(config, device, args.problem, args.mode)
+    #config -> you know a lot about it
+    #device -> whether we are using gpu or not
+    #args.problem -> type of problem we are using
+    #args.mode -> which one -> mdp, tmdp+DFS, tmdp+ObjLim
+
     brain = Brain(config, device, args.problem, args.mode)
     agent_pool = AgentPool(brain, config['num_agents'], config['time_limit'], args.mode)
     agent_pool.start()
-    is_validation_epoch = lambda epoch: (epoch % config['validate_every'] == 0) or (epoch == config['num_epochs'])
+
+
+
+    is_validation_epoch = lambda epoch: (epoch % config['validate_every'] == 0) or (epoch == config['num_epochs'])   # eveyoften you want to validate but if you reach to the end?
     is_training_epoch = lambda epoch: (epoch < config['num_epochs'])
 
     # Already start jobs

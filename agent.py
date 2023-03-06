@@ -32,6 +32,7 @@ class AgentPool():
         self.policy_queries_queue.join()
 
     def start_job(self, instances, sample_rate, greedy=False, block_policy=False):
+
         """
         Starts a job.
         A job is a set of tasks. A task consists of an instance that needs to be solved and instructions
@@ -40,6 +41,7 @@ class AgentPool():
         to a job. It is the job sponsor who holds the lists of tasks. The role of the job sponsor is to
         keep track of which tasks have been completed.
         """
+        
         job_sponsor = queue.Queue()
         samples = []
         stats = []

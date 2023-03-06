@@ -27,7 +27,7 @@ class Brain:
         current_date = datetime.now().strftime('%Y-%m-%d')
         current_time = datetime.now().strftime('%H.%M.%S')
         self.timestamp = f"{current_date}--{current_time}"
-
+ 
     def sample_action_idx(self, states, greedy):
 
         if isinstance(greedy, bool):
