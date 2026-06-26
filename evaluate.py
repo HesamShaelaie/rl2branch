@@ -107,13 +107,13 @@ if __name__ == "__main__":
                 ### MODEL LOADING ###
                 model = GNNPolicy().to(device)
                 if policy['name'] == 'il':
-                    model.load_state_dict(torch.load(f'actor/{args.problem}/0/il.pkl'))
+                    model.load_state_dict(torch.load(f'actor/{args.problem}/0/il.pkl', map_location=device))
                 elif policy['name'] == 'mdp':
-                    model.load_state_dict(torch.load(f'actor/{args.problem}/0/mdp.pkl'))
+                    model.load_state_dict(torch.load(f'actor/{args.problem}/0/mdp.pkl', map_location=device))
                 elif policy['name'] == 'tmdp+DFS':
-                    model.load_state_dict(torch.load(f'actor/{args.problem}/0/tmdp+DFS.pkl'))
+                    model.load_state_dict(torch.load(f'actor/{args.problem}/0/tmdp+DFS.pkl', map_location=device))
                 elif policy['name'] == 'tmdp+ObjLim':
-                    model.load_state_dict(torch.load(f'actor/{args.problem}/0/tmdp+ObjLim.pkl'))
+                    model.load_state_dict(torch.load(f'actor/{args.problem}/0/tmdp+ObjLim.pkl', map_location=device))
                 else:
                     raise Exception(f"Unrecognized GNN policy {policy[name]}")
                 loaded_models[policy['name']] = model

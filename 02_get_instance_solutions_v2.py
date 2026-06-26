@@ -1,53 +1,50 @@
 # * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * #
-# Generates file with solutions to the training instances. Needs to be run once #
-# before training.                                                              #                                                                     #
+# Generates file with solutions to the training instances (MPS format).        #
+# Uses Gurobi directly instead of Ecole. Reads MPS files produced by           #
+# 01_generate_instances_v2.py and writes results in the same JSON format as    #
+# 02_get_instance_solutions.py.                                                 #
+# Needs to be run once before training.                                         #
 # Usage:                                                                        #
-# python 02_get_instance_solutions.py <type> -j <njobs> -n <ninstances>         #
+# python 02_get_instance_solutions_v2.py <type> -j <njobs> -n <ninstances>     #
 # * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * #
 
 import glob
 import json
-import sys
 import argparse
 import threading
 import queue
 
-import ecole
-
-class OptimalSol:
-    def __init__(self):
-        pass
-
-    def before_reset(self, model):
-        pass
-
-    def extract(self, model, done=False):
-        pyscipopt_model = model.as_pyscipopt()
-        if done: reward = pyscipopt_model.getObjVal(original=True)
-        else: reward = None
-        return reward
+import gurobipy as gp
+from gurobipy import GRB
 
 
 def solve_instance(in_queue, out_queue):
     """
-    Worker loop: fetch an instance, run an episode and record samples.
+    Worker loop: fetch an MPS instance, solve with Gurobi, record optimal value.
+
     Parameters
     ----------
     in_queue : queue.Queue
-        Input queue from which instances are received.
+        Input queue from which instance file paths are received.
     out_queue : queue.Queue
-        Output queue in which to solution.
+        Output queue into which {path: obj_value} dicts are placed.
     """
-    reward_fun = OptimalSol()
     while not in_queue.empty():
         instance = in_queue.get()
-        env = ecole.environment.Configuring( scip_params={},
-                                             observation_function=None,
-                                             reward_function=reward_fun )
-        env.reset(str(instance))
-        print(f'Solving {instance}')
-        _, _, solution, _, _ = env.step({})
-        out_queue.put({instance: solution})
+        try:
+            model = gp.read(str(instance))
+            model.setParam('OutputFlag', 0)   # suppress Gurobi console output
+            model.setParam('LogFile', '')      # suppress log file creation
+            model.optimize()
+            if model.status == GRB.OPTIMAL:
+                solution = model.ObjVal
+            else:
+                solution = None
+        except gp.GurobiError as e:
+            print(f'Gurobi error on {instance}: {e}')
+            solution = None
+        print(f'Solved {instance}  ->  {solution}')
+        out_queue.put({str(instance): solution})
 
 
 if __name__ == '__main__':
@@ -97,14 +94,12 @@ if __name__ == '__main__':
             workers.append(p)
             p.start()
 
-        i = 0
         solutions = {}
-        while i < num_inst:
+        for i in range(num_inst):
             answer = answers_queue.get()
             solutions.update(answer)
-            i += 1
 
-        with open(os.path.join(instance_dir, "instance_solutions.json"), "w") as f:
+        with open(os.path.join(instance_dir, 'instance_solutions.json'), 'w') as f:
             json.dump(solutions, f)
 
         for p in workers:
@@ -112,25 +107,26 @@ if __name__ == '__main__':
 
         import sys; sys.exit(0)
 
+    # Point to the _mps directories produced by 01_generate_instances_v2.py
     if args.problem == 'setcover':
-        instance_dir = 'data/instances/setcover/train_400r_750c_0.05d'
-        instances = glob.glob(instance_dir + '/*.lp')
+        instance_dir = 'data/instances/setcover/train_400r_750c_0.05d_mps'
+        instances = glob.glob(instance_dir + '/*.mps')
     elif args.problem == 'cauctions':
-        instance_dir = 'data/instances/cauctions/train_100_500'
-        instances = glob.glob(instance_dir + '/*.lp')
+        instance_dir = 'data/instances/cauctions/train_100_500_mps'
+        instances = glob.glob(instance_dir + '/*.mps')
     elif args.problem == 'indset':
-        instance_dir = 'data/instances/indset/train_500_4'
-        instances = glob.glob(instance_dir + '/*.lp')
+        instance_dir = 'data/instances/indset/train_500_4_mps'
+        instances = glob.glob(instance_dir + '/*.mps')
     elif args.problem == 'ufacilities':
-        instance_dir = 'data/instances/ufacilities/train_35_35_5'
-        instances = glob.glob(instance_dir + '/*.lp')
+        instance_dir = 'data/instances/ufacilities/train_35_35_5_mps'
+        instances = glob.glob(instance_dir + '/*.mps')
     elif args.problem == 'mknapsack':
-        instance_dir = 'data/instances/mknapsack/train_100_6'
-        instances = glob.glob(instance_dir + '/*.lp')
+        instance_dir = 'data/instances/mknapsack/train_100_6_mps'
+        instances = glob.glob(instance_dir + '/*.mps')
     else:
         raise NotImplementedError
 
-    num_inst = min(args.ninst,len(instances))
+    num_inst = min(args.ninst, len(instances))
     orders_queue = queue.Queue()
     answers_queue = queue.Queue()
     for instance in instances[:num_inst]:
@@ -146,14 +142,12 @@ if __name__ == '__main__':
         workers.append(p)
         p.start()
 
-    i = 0
     solutions = {}
-    while i < num_inst:
+    for i in range(num_inst):
         answer = answers_queue.get()
         solutions.update(answer)
-        i += 1
 
-    with open(instance_dir + "/instance_solutions.json", "w") as f:
+    with open(instance_dir + '/instance_solutions.json', 'w') as f:
         json.dump(solutions, f)
 
     for p in workers:

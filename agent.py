@@ -238,14 +238,15 @@ class Agent(threading.Thread):
 
 
 class TreeRecorder:
+    
     """
     Records the branch-and-bound tree from a custom brancher.
-
     Every node in SCIP has a unique node ID. We identify nodes and their corresponding
     attributes through the same ID system.
     Depth groups keep track of groups of nodes at the same depth. This data structure
     is used to speed up the computation of the subtree size.
     """
+    
     def __init__(self):
         self.tree = {}
         self.depth_groups = []

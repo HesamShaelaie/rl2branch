@@ -1,0 +1,10 @@
+data/instances/mknapsack/train_100_6/instance_1.lp
+data/instances/mknapsack/train_100_6/instance_2.lp
+data/instances/mknapsack/train_100_6/instance_3.lp
+data/instances/mknapsack/train_100_6/instance_4.lp
+data/instances/mknapsack/train_100_6/instance_5.lp
+data/instances/mknapsack/train_100_6/instance_6.lp
+data/instances/mknapsack/train_100_6/instance_7.lp
+data/instances/mknapsack/train_100_6/instance_8.lp
+data/instances/mknapsack/train_100_6/instance_9.lp
+data/instances/mknapsack/train_100_6/instance_10.lp

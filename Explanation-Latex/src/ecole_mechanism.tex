@@ -1,0 +1,112 @@
+% ============================================================
+\section{Ecole Reward Mechanism and the One-Step Solve}
+
+This section explains in depth how the \texttt{OptimalSol} reward class and \texttt{solve\_instance} function interact with Ecole internals, and why a single call to \texttt{env.step()} is sufficient to retrieve the optimal objective value of a MIP instance.
+
+% ============================================================
+\subsection{The Ecole Environment Interface}
+
+Ecole models combinatorial optimization as a sequential decision process following the OpenAI Gym convention. Every Ecole environment exposes two primary methods:
+
+\begin{itemize}
+    \item \texttt{env.reset(instance\_path)} --- loads a new MIP instance into SCIP, initializes internal state, and returns the first observation.
+    \item \texttt{env.step(action)} --- applies one \emph{action} (e.g., a branching decision or a parameter configuration), advances the solver, and returns a 5-tuple \texttt{(observation, action\_set, reward, done, info)}.
+\end{itemize}
+
+The \texttt{reward} in the returned tuple is not computed inside \texttt{env.step()} itself. Instead, Ecole delegates reward computation to a user-supplied \emph{reward function} object --- in this script, an instance of \texttt{OptimalSol}.
+
+% ============================================================
+\subsection{What Is \texttt{extract} and When Is It Called?}
+
+Every Ecole reward function must implement two methods that Ecole calls automatically at specific points in the episode lifecycle:
+
+\begin{lstlisting}
+class OptimalSol:
+    def before_reset(self, model): pass
+
+    def extract(self, model, done=False):
+        pyscipopt_model = model.as_pyscipopt()
+        if done:
+            reward = pyscipopt_model.getObjVal(original=True)
+        else:
+            reward = None
+        return reward
+\end{lstlisting}
+
+\begin{description}
+    \item[\texttt{before\_reset(model)}]
+        Called by Ecole \emph{before} \texttt{env.reset()} loads a new instance. It is the place to initialize any per-episode state. Here it is a no-op because \texttt{OptimalSol} holds no state of its own.
+
+    \item[\texttt{extract(model, done)}]
+        Called by Ecole \emph{inside every} \texttt{env.step()} call, \emph{after} the solver has advanced by one action. Ecole passes two arguments:
+        \begin{itemize}
+            \item \texttt{model} --- the live Ecole model wrapper around the current SCIP state.
+            \item \texttt{done} --- a boolean that is \texttt{True} only when the episode has ended (i.e.\ SCIP has finished solving and there are no more decisions to make).
+        \end{itemize}
+        Whatever value \texttt{extract} returns becomes the \texttt{reward} field in \texttt{env.step()}'s return tuple.
+\end{description}
+
+The conditional logic inside \texttt{extract} is therefore:
+\begin{itemize}
+    \item If \texttt{done=False} (solver still running, mid-episode): return \texttt{None} --- no meaningful reward yet.
+    \item If \texttt{done=True} (solver finished): call \texttt{pyscipopt\_model.getObjVal(original=True)} and return the optimal objective value.
+\end{itemize}
+
+The flag \texttt{original=True} in \texttt{getObjVal} instructs PySCIPOpt to report the value in the \emph{original} objective space, undoing any internal transformations SCIP may have applied (e.g., negating a maximisation objective to convert it to minimisation form).
+
+% ============================================================
+\subsection{Why One \texttt{env.step()} Is Enough}
+
+The key is the choice of Ecole environment: \texttt{ecole.environment.Configuring}.
+
+\subsubsection{Configuring vs.\ Branching Environments}
+
+Most Ecole environments (e.g., \texttt{Branching}) model branch-and-bound as a \emph{multi-step} process: each call to \texttt{env.step()} applies a single branching decision and returns control to Python, so the episode runs for as many steps as there are branching nodes. These environments are used for training branching policies.
+
+\texttt{Configuring} is different. Its action space is a dictionary of SCIP parameters to set before the solve begins. Once the parameters are applied, SCIP runs \emph{to completion} --- the entire branch-and-bound tree is explored internally, without returning to Python at intermediate nodes. The episode therefore consists of exactly \textbf{one step}:
+
+\begin{enumerate}
+    \item \texttt{env.reset(instance\_path)} --- loads the instance; \texttt{before\_reset} is called.
+    \item \texttt{env.step(\{\})} --- applies no parameter changes (empty dict), triggers SCIP to solve the full MIP, and returns once the solve is complete with \texttt{done=True}.
+\end{enumerate}
+
+\subsubsection{The Internal Call Sequence}
+
+When \texttt{env.step(\{\})} is called in \texttt{solve\_instance}:
+
+\begin{enumerate}
+    \item Ecole applies the (empty) parameter dictionary to SCIP --- a no-op here.
+    \item SCIP runs its full branch-and-bound algorithm internally until it finds and verifies the optimal solution.
+    \item Ecole sets \texttt{done = True} and calls \texttt{reward\_fun.extract(model, done=True)}.
+    \item \texttt{extract} queries \texttt{pyscipopt\_model.getObjVal(original=True)} and returns the optimal value.
+    \item \texttt{env.step()} returns \texttt{(None, None, optimal\_value, True, \{\})}.
+\end{enumerate}
+
+Back in \texttt{solve\_instance}, only the third element of the tuple is used:
+
+\begin{lstlisting}
+_, _, solution, _, _ = env.step({})
+out_queue.put({instance: solution})
+\end{lstlisting}
+
+The variables \texttt{observation}, \texttt{action\_set}, \texttt{done}, and \texttt{info} are all discarded with \texttt{\_} because they are irrelevant for pure instance solving.
+
+\subsubsection{Summary of the Episode Lifecycle}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Call} & \textbf{Ecole internally calls} & \textbf{Result} \\
+\midrule
+\texttt{env.reset(path)} & \texttt{before\_reset(model)} & instance loaded into SCIP \\
+\texttt{env.step(\{\})} & SCIP solves full MIP & \texttt{done=True} \\
+                        & \texttt{extract(model, done=True)} & returns \texttt{ObjVal} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Because the \texttt{Configuring} environment always terminates in one step, \texttt{extract} is only ever called once per instance with \texttt{done=True}, so the \texttt{done=False} branch (which returns \texttt{None}) is never actually reached in this script. It exists only to satisfy the Ecole reward function interface, which is designed to also support multi-step environments.
+
+\subsection{Contrast With Training Usage}
+
+In the reinforcement learning training phase (e.g., \texttt{05\_train\_rl.py}), a \emph{branching} environment is used instead. There, \texttt{env.step()} is called once per branching decision, and \texttt{extract} is called with \texttt{done=False} at every intermediate node and with \texttt{done=True} only at the end. A reward function in that context might return incremental values at each step. The \texttt{OptimalSol} class here is a degenerate case of that general interface, repurposed for simple instance solving with no learning.

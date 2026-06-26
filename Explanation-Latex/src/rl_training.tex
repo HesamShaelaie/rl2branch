@@ -1,0 +1,218 @@
+% ============================================================
+\section{Reinforcement Learning Training and Evaluation}
+
+This section documents \texttt{05\_train\_rl.py} (training) and \texttt{evaluate.py} (evaluation). Together they implement a policy-gradient method that trains a Graph Neural Network (GNN) to make variable-selection decisions inside SCIP's branch-and-bound solver, with the objective of minimising the total number of nodes explored.
+
+% ============================================================
+\subsection{Branch-and-Bound as a Markov Decision Process}
+
+Branch-and-bound solves a MIP by recursively splitting the feasible region along integer variables. At each \emph{branching node} the solver must choose a fractional variable to branch on --- this is the \emph{variable selection} (or \emph{branching}) decision. The quality of this choice directly determines how quickly the tree can be pruned and how many nodes must be processed before the optimal solution is certified.
+
+The paper casts variable selection as an MDP with the following components:
+
+\begin{description}
+    \item[State $s_t$] The \texttt{NodeBipartite} observation produced by Ecole at the current open node: a bipartite graph whose left nodes are the active constraints (with LP-derived features) and whose right nodes are the candidate variables (with LP, branching-history, and objective features). Edge features encode the constraint matrix coefficients.
+    \item[Action $a_t$] An integer index into \texttt{action\_set}, the set of LP-fractional candidate variables at the current node.
+    \item[Reward $r_t$] A scalar that depends on the training mode (see Section~\ref{sec:training_modes}); in all modes it is proportional to the \emph{negative} number of nodes explored, so maximising the expected return corresponds to finding a smaller search tree.
+    \item[Episode] One full branch-and-bound solve of a single MIP instance. An episode ends when SCIP certifies optimality (or exceeds the time limit).
+\end{description}
+
+% ============================================================
+\subsection{Policy: the GNN Actor}
+
+The policy $\pi_\theta$ is a Graph Neural Network (\texttt{GNNPolicy} in \texttt{actor/actor.py}). It takes the \texttt{NodeBipartite} bipartite graph as input and outputs a scalar logit for every candidate variable:
+
+\begin{lstlisting}
+logits = self.actor(
+    batch.constraint_features,   # constraint node features
+    batch.edge_index,            # bipartite adjacency
+    batch.edge_attr,             # edge (coefficient) features
+    batch.variable_features      # variable node features
+)
+logits = logits[batch.action_set]   # restrict to LP candidates
+\end{lstlisting}
+
+Action selection from these logits is either:
+\begin{itemize}
+    \item \textbf{Greedy} (validation/evaluation): $a = \arg\max_i \, \texttt{logits}_i$.
+    \item \textbf{Stochastic} (training): $a \sim \mathrm{Categorical}(\texttt{logits})$, i.e.\ a sample from the softmax distribution.
+\end{itemize}
+
+% ============================================================
+\subsection{Training Modes}
+\label{sec:training_modes}
+
+Three training modes are implemented, each with a different MDP formulation. They share the same GNN architecture and REINFORCE update rule but differ in how episodes are truncated and how returns are computed.
+
+\subsubsection{\texttt{mdp} --- Standard MDP}
+
+The standard full-tree MDP. The environment (\texttt{MDPBranchingEnv}) runs SCIP with its default node selector. The return assigned to a transition collected at step $t$ (node $n_t$) is:
+
+\[
+    G_t = c_{t} - c_{\text{final}}
+\]
+
+where $c_t$ is the cumulative node count at step $t$ and $c_{\text{final}}$ is the cumulative node count at episode end. Because $c_t \leq c_{\text{final}}$, this is always $\leq 0$, and equals zero only if no further nodes are opened after branching at $n_t$. Equivalently, $G_t$ equals minus the number of nodes opened \emph{after} step $t$.
+
+\begin{lstlisting}
+# credit assignment for mdp
+for transition in transitions:
+    transition.returns = transition.cum_nnodes - cum_nnodes
+\end{lstlisting}
+
+\subsubsection{\texttt{tmdp+DFS} --- Truncated MDP with Depth-First Search}
+
+During training the node selector is overridden to Depth-First Search (DFS), which forces SCIP to explore one branch completely before backtracking (\texttt{DFSBranchingDynamics}). This truncates the episode to a single root-to-leaf path, making trajectories shorter and variance lower. The return is the \emph{negative subtree size} rooted at the branching node:
+
+\[
+    G_t = -|\mathrm{subtree}(n_t)| - 1
+\]
+
+The \texttt{TreeRecorder} class computes subtree sizes in a bottom-up pass over the recorded branching decisions. A DFS trajectory visits every node in the explored subtree exactly once, so this return directly measures the cost of the branching decision.
+
+\begin{lstlisting}
+# credit assignment for tmdp+DFS and tmdp+ObjLim
+subtree_sizes = tree_recorder.calculate_subtree_sizes()
+for transition in transitions:
+    transition.returns = -subtree_sizes[transition.node_id] - 1
+\end{lstlisting}
+
+\subsubsection{\texttt{tmdp+ObjLim} --- Truncated MDP with Objective Limit}
+
+Instead of changing the node selector, this mode injects a \emph{primal bound} (objective limit) into SCIP at the start of each episode (\texttt{ObjLimBranchingDynamics}). The bound is set to the pre-computed optimal value $z^*$ plus a small slack $\varepsilon$:
+
+\begin{lstlisting}
+# in train_batch_generator()
+eps = -0.1 if maximization else 0.1
+yield [{'path': instance,
+        'sol': train_sols[instance] + eps,   # primal bound
+        'seed': ...}
+       for instance in ...]
+\end{lstlisting}
+
+Any node whose LP relaxation cannot improve beyond this bound is pruned immediately by SCIP. This truncates the tree from below: only nodes that could potentially discover a solution better than $z^* + \varepsilon$ are explored, which typically reduces the tree to the left-most branch plus a handful of pruned siblings. Credit assignment is the same subtree-size formula as \texttt{tmdp+DFS}.
+
+% ============================================================
+\subsection{Concurrent Agent Architecture}
+
+\subsubsection{Overview of Threads}
+
+Running one Ecole environment at a time would leave the GPU idle while SCIP is branching. The code uses a multi-threaded design with three kinds of threads (see \texttt{agent.py}):
+
+\begin{enumerate}
+    \item \textbf{Agent threads} (\texttt{num\_agents = 12}): Each agent owns one Ecole branching environment. At every branching node it extracts the state, sends a policy query to the \texttt{PolicySampler}, waits for the action, then steps the environment.
+    \item \textbf{PolicySampler thread}: Drains the \texttt{policy\_queries\_queue}, accumulates all waiting requests into a batch, calls \texttt{brain.sample\_action\_idx()} (a single GPU forward pass), and distributes the resulting action indices back to the requesting agents.
+    \item \textbf{Main thread}: Manages the epoch loop, calls \texttt{brain.update()}, triggers validation, and saves checkpoints.
+\end{enumerate}
+
+The key benefit is \emph{GPU batching}: because all 12 agents submit policy queries concurrently, the PolicySampler can process them in one batch rather than 12 serial forward passes.
+
+\subsubsection{Preemptive Job Scheduling}
+
+Jobs are submitted with \texttt{block\_policy=True}, which creates a \texttt{threading.Event} (\texttt{policy\_access}) that is initially \emph{unset}. Agents load their instances and run SCIP until the first branching node, then block on \texttt{policy\_access.wait()}. The main thread sets \texttt{policy\_access.set()} only when it is ready to service the epoch, at which point all blocked agents proceed simultaneously. This overlaps SCIP's instance-loading time with the neural-network update of the previous epoch:
+
+\begin{lstlisting}
+# start next epoch's jobs before processing current epoch's results
+if is_training_epoch(epoch + 1):
+    t_samples_next, ..., t_access_next = \
+        agent_pool.start_job(train_batch, ..., block_policy=True)
+
+# ... process and update current epoch ...
+
+# release the preempted agents
+t_access.set()
+\end{lstlisting}
+
+% ============================================================
+\subsection{REINFORCE Policy Gradient Update}
+
+After all training episodes in an epoch finish, the main thread calls \texttt{brain.update(transitions)}. The loss combines a REINFORCE term and an entropy bonus:
+
+\[
+    \mathcal{L}(\theta) = -\frac{1}{N} \sum_{i=1}^{N} G_i \cdot \log \pi_\theta(a_i \mid s_i)
+                          \;-\; \beta \cdot \frac{1}{N}\sum_{i=1}^{N} H[\pi_\theta(\cdot \mid s_i)]
+\]
+
+where $N$ is the total number of collected transitions, $G_i$ is the return, and $H$ denotes the entropy of the action distribution. The entropy bonus (weight $\beta = 10^{-5}$) prevents premature collapse to a deterministic policy during training. The optimizer is Adam with learning rate $10^{-6}$.
+
+\begin{lstlisting}
+# REINFORCE term
+reinforce_loss = - (returns * dist.log_prob(batch.action)).sum() / n_samples
+# Entropy bonus (subtracted to maximise entropy)
+entropy = dist.entropy().sum() / n_samples
+loss = reinforce_loss - entropy_bonus * entropy
+loss.backward()
+optimizer.step()
+\end{lstlisting}
+
+Only a fraction \texttt{sample\_rate = 0.05} of branching decisions is collected per episode to reduce memory usage and decorrelate samples.
+
+% ============================================================
+\subsection{Training Loop}
+
+\begin{enumerate}
+    \item Read \texttt{config.default.json} and apply any command-line overrides.
+    \item Load training instances and pre-computed optimal solutions (\texttt{instance\_solutions.json}).
+    \item Instantiate \texttt{Brain} (GNNPolicy + Adam optimizer) and \texttt{AgentPool} (12 agent threads + PolicySampler).
+    \item For each epoch $e = 0, \ldots, T$ (default $T = 20000$):
+    \begin{enumerate}
+        \item \textbf{Validation} (every 50 epochs): run greedy policy on 20 instances $\times$ 5 seeds. Compute 1-shifted geometric mean of nnodes. Save model if this is the best value so far.
+        \item \textbf{Training}: sample a random batch of 10 training instances; collect REINFORCE transitions; call \texttt{brain.update()}.
+    \end{enumerate}
+    \item Stop after 6 days of wall-clock time regardless of epoch count.
+\end{enumerate}
+
+The model checkpoint is written to \texttt{actor/<problem>/0/<timestamp>--best\_params--<mode>.pkl}.
+
+% ============================================================
+\subsection{Evaluation (\texttt{evaluate.py})}
+
+\subsubsection{Benchmark Design}
+
+Evaluation tests every combination of policy $\times$ instance $\times$ seed, writing all results to a CSV file. Two instance sets are used:
+
+\begin{itemize}
+    \item \textbf{Test}: 40 instances drawn from the same distribution as training.
+    \item \textbf{Transfer}: 40 instances from a harder distribution (e.g.\ larger graphs or more knapsacks), testing out-of-distribution generalisation.
+\end{itemize}
+
+Each instance is solved with 5 random seeds (0--4) to account for SCIP's internal stochasticity.
+
+\subsubsection{Policies Evaluated}
+
+\paragraph{SCIP internal brancher (\texttt{relpscost}).}
+Reliability Pseudocost Branching is SCIP's state-of-the-art default rule. It is run via the \texttt{Configuring} environment: the brancher priority is raised to the highest level, then \texttt{env.step(\{\})} triggers a full solve in one call (see Section~3 for how this works internally).
+
+\paragraph{GCNN models (\texttt{il}, \texttt{mdp}, \texttt{tmdp+DFS}, \texttt{tmdp+ObjLim}).}
+Each GNN model is run via the \texttt{Branching} environment. At every branching node the agent observes \texttt{NodeBipartite} features and selects the variable with the highest logit (greedy):
+
+\begin{lstlisting}
+observation, action_set, _, done, _ = env.reset(instance['path'])
+while not done:
+    # observation -> tensor features
+    logits = policy['model'](*observation)
+    action = action_set[logits[action_set.astype(np.int64)].argmax()]
+    observation, action_set, _, done, _ = env.step(action)
+\end{lstlisting}
+
+\subsubsection{Metrics Recorded}
+
+For each instance-policy-seed triple the following metrics are written to the CSV:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Field} & \textbf{Meaning} \\
+\midrule
+\texttt{nnodes}   & Number of branch-and-bound nodes processed \\
+\texttt{nlps}     & Number of LP relaxations solved \\
+\texttt{stime}    & SCIP solving time (s) \\
+\texttt{gap}      & Optimality gap at termination \\
+\texttt{status}   & SCIP termination status (optimal, timelimit, \ldots) \\
+\texttt{walltime} & Wall-clock time including Python overhead \\
+\texttt{proctime} & CPU process time \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The primary metric for comparing policies is \texttt{nnodes}: fewer nodes means the learned branching policy pruned the tree more efficiently than the baseline. The time limit is 3600 seconds per instance; instances not solved to optimality within this budget are recorded with their current gap.

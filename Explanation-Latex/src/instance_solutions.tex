@@ -1,0 +1,147 @@
+% ============================================================
+\section{Instance Solution Collection}
+
+% ============================================================
+\subsection{Overview}
+
+The script \texttt{02\_get\_instance\_solutions.py} solves all training instances for a given problem class and records their optimal objective values. It must be run once before training, because the downstream learning pipeline requires ground-truth optimal values as supervision signals.
+
+The script accepts three command-line arguments:
+
+\begin{lstlisting}
+python 02_get_instance_solutions.py <problem> [-j NJOBS] [-n NINST]
+# problem: one of {setcover, cauctions, indset, mknapsack, ufacilities}
+# njobs:   number of parallel worker threads (default 1)
+# ninst:   maximum number of instances to solve (default 10000)
+\end{lstlisting}
+
+It scans the training directory for the selected problem, solves up to \texttt{ninst} instances in parallel using \texttt{njobs} threads, and writes a single JSON file \texttt{instance\_solutions.json} mapping each instance file path to its optimal objective value.
+
+\subsubsection{Dependencies}
+
+The script relies on two external libraries:
+\begin{itemize}
+    \item \textbf{Ecole} --- a Python library that wraps the SCIP solver and exposes a Gym-style reinforcement-learning interface for combinatorial optimization. The \texttt{ecole.environment.Configuring} environment is used here not for learning, but simply to solve each instance to optimality.
+    \item \textbf{PySCIPOpt} --- accessed indirectly through Ecole via \texttt{model.as\_pyscipopt()}, used to retrieve the optimal objective value after solving.
+\end{itemize}
+
+% ============================================================
+\subsection{Reward Function: \texttt{OptimalSol}}
+
+Ecole environments accept a custom \emph{reward function} object that specifies what scalar feedback to return after each step. \texttt{OptimalSol} implements this interface:
+
+\begin{lstlisting}
+class OptimalSol:
+    def before_reset(self, model): pass   # no setup needed
+
+    def extract(self, model, done=False):
+        pyscipopt_model = model.as_pyscipopt()
+        if done:
+            reward = pyscipopt_model.getObjVal(original=True)
+        else:
+            reward = None
+        return reward
+\end{lstlisting}
+
+\begin{itemize}
+    \item \texttt{before\_reset} is called by Ecole before each episode; it is a no-op here.
+    \item \texttt{extract} is called after every \texttt{env.step()}. When \texttt{done=True} (i.e.\ the solver has finished), it returns the optimal objective value via \texttt{getObjVal(original=True)}. The flag \texttt{original=True} ensures the value is reported in the original, un-transformed objective space. Before the episode is done it returns \texttt{None}.
+\end{itemize}
+
+% ============================================================
+\subsection{Worker Thread: \texttt{solve\_instance}}
+
+\texttt{solve\_instance} is the function executed by each parallel worker thread. It loops over instances from a shared input queue until the queue is empty:
+
+\begin{lstlisting}
+def solve_instance(in_queue, out_queue):
+    reward_fun = OptimalSol()
+    while not in_queue.empty():
+        instance = in_queue.get()
+        env = ecole.environment.Configuring(
+            scip_params={},
+            observation_function=None,
+            reward_function=reward_fun)
+        env.reset(str(instance))         # load the .lp file
+        _, _, solution, _, _ = env.step({})  # solve; solution = ObjVal
+        out_queue.put({instance: solution})
+\end{lstlisting}
+
+\subsubsection{Ecole \texttt{Configuring} Environment}
+
+The \texttt{Configuring} environment is the simplest Ecole environment: it loads an LP/MIP file, applies any SCIP parameter configuration supplied via \texttt{env.step(params\_dict)}, and solves to optimality. Passing an empty dict \texttt{\{\}} means ``apply no configuration changes, just solve.'' The five return values of \texttt{env.step()} are \texttt{(observation, action\_set, reward, done, info)}; only the third (\texttt{reward}) is used here, which equals the optimal objective value as defined by \texttt{OptimalSol.extract}.
+
+\subsubsection{Thread Safety Note}
+
+The \texttt{while not in\_queue.empty()} guard is not strictly atomic: two threads could both observe a non-empty queue before either calls \texttt{get()}. In practice this is harmless because \texttt{queue.Queue.get()} itself is thread-safe and raises \texttt{queue.Empty} if the queue is already drained; the worst outcome is that one thread exits the loop one iteration late.
+
+% ============================================================
+\subsection{Main Script Block}
+
+\subsubsection{Instance Discovery}
+
+After parsing arguments, the script selects the training directory for the chosen problem and collects all \texttt{.lp} files with \texttt{glob}:
+
+\begin{lstlisting}
+if args.problem == 'setcover':
+    instance_dir = 'data/instances/setcover/train_400r_750c_0.05d'
+# ... (one branch per problem type)
+instances = glob.glob(instance_dir + '/*.lp')
+num_inst = min(args.ninst, len(instances))
+\end{lstlisting}
+
+The directory names match exactly those produced by \texttt{01\_generate\_instances.py}.
+
+\subsubsection{Producer--Consumer Architecture}
+
+The script uses two \texttt{queue.Queue} objects and a pool of daemon threads:
+
+\begin{enumerate}
+    \item \textbf{Fill the input queue}: the first \texttt{num\_inst} instance paths are enqueued.
+    \item \textbf{Launch workers}: \texttt{njobs} daemon threads are started, each running \texttt{solve\_instance(orders\_queue, answers\_queue)}.
+    \item \textbf{Collect results}: the main thread blocks on \texttt{answers\_queue.get()} exactly \texttt{num\_inst} times, accumulating a \texttt{solutions} dict.
+\end{enumerate}
+
+\begin{lstlisting}
+for instance in instances[:num_inst]:
+    orders_queue.put(instance)
+
+for i in range(args.njobs):
+    p = threading.Thread(target=solve_instance,
+                         args=(orders_queue, answers_queue),
+                         daemon=True)
+    p.start()
+
+solutions = {}
+for i in range(num_inst):
+    solutions.update(answers_queue.get())
+\end{lstlisting}
+
+Because the threads are daemon threads, they are killed automatically if the main thread exits. The final \texttt{assert not p.is\_alive()} sanity-checks that all workers finished before the main thread reached that point (which is guaranteed because the main thread collected all \texttt{num\_inst} answers first).
+
+\subsubsection{Output}
+
+The \texttt{solutions} dict maps each instance file path (as a string) to its optimal objective value (a float). It is serialized as JSON:
+
+\begin{lstlisting}
+with open(instance_dir + "/instance_solutions.json", "w") as f:
+    json.dump(solutions, f)
+\end{lstlisting}
+
+The file is written into the same training directory as the instances, e.g.:
+
+\begin{lstlisting}
+data/instances/setcover/train_400r_750c_0.05d/instance_solutions.json
+\end{lstlisting}
+
+% ============================================================
+\subsection{Execution Flow Summary}
+
+\begin{enumerate}
+    \item Parse \texttt{problem}, \texttt{njobs}, \texttt{ninst}.
+    \item Discover training \texttt{.lp} files; cap at \texttt{ninst}.
+    \item Enqueue all instance paths into \texttt{orders\_queue}.
+    \item Spawn \texttt{njobs} solver threads.
+    \item Each thread: load instance $\to$ solve with SCIP via Ecole $\to$ record optimal value.
+    \item Main thread collects all results and writes \texttt{instance\_solutions.json}.
+\end{enumerate}

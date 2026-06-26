@@ -1,0 +1,435 @@
+% ============================================================
+\section{Data Generation}
+
+% ============================================================
+\subsection{Overview}
+
+The script \texttt{01\_generate\_instances.py} generates random benchmark instances for five classes of Mixed-Integer Linear Programs (MILPs). All instances are written in CPLEX LP format. The script accepts a problem type and a random seed, then produces four dataset splits: train, validation, test, and transfer.
+
+\subsubsection{Code Structure}
+
+The file is organized into four logical parts:
+
+\begin{enumerate}
+    \item \textbf{Graph utility class} (\texttt{Graph}) --- container and random graph generators used by the Independent Set problem.
+    \item \textbf{Instance generator functions} --- one function per problem class, each writing a single \texttt{.lp} file.
+    \item \textbf{Seed validation helper} (\texttt{valid\_seed}) --- argument type checker.
+    \item \textbf{Main script block} (\texttt{\_\_main\_\_}) --- parses arguments, defines dataset splits, and calls the generators in sequence.
+\end{enumerate}
+
+\subsubsection{Shared Random State}
+
+A single \texttt{numpy.random.RandomState} object \texttt{rng} is created from the command-line seed (default $s=0$) and passed to every generator. Instances are generated in the fixed order train $\to$ validation $\to$ test $\to$ transfer, so all draws are fully deterministic for a given seed.
+
+\subsubsection{Dataset Splits}
+
+Table~\ref{tab:splits} summarizes the number of instances per split.
+
+\begin{table}[h]
+\centering
+\caption{Number of instances per split and problem class.}
+\label{tab:splits}
+\begin{tabular}{lrrrr}
+\toprule
+Problem & Train & Validation & Test & Transfer \\
+\midrule
+Set Cover          & 10{,}000 & 2{,}000 & 100 & 100 \\
+Independent Set    & 10{,}000 & 2{,}000 & 100 & 100 \\
+Comb.\ Auctions    & 10{,}000 & 2{,}000 & 100 & 100 \\
+Uncap.\ Facilities & 10{,}000 & 2{,}000 & 100 & 100 \\
+Mult.\ Knapsack    & 10{,}000 & 2{,}000 & 100 & 100 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The transfer split uses strictly larger instances than the other three splits to test out-of-distribution generalization.
+
+% ============================================================
+\subsection{Graph Utility Class (\texttt{Graph})}
+
+\subsubsection{Purpose}
+
+The \texttt{Graph} class is a lightweight container and factory used exclusively by the Independent Set generator. It stores nodes, edges, degree array, and neighbor sets.
+
+\subsubsection{Constructor}
+
+\begin{lstlisting}
+class Graph:
+    def __init__(self, number_of_nodes, edges, degrees, neighbors):
+        self.number_of_nodes = number_of_nodes
+        self.edges   = edges      # set of (int, int) tuples
+        self.degrees = degrees    # numpy int array, length |V|
+        self.neighbors = neighbors  # dict: node -> set of nodes
+\end{lstlisting}
+
+\subsubsection{Greedy Clique Partition (\texttt{greedy\_clique\_partition})}
+
+Used to tighten the LP relaxation of the Independent Set formulation. The algorithm:
+
+\begin{enumerate}
+    \item Sorts nodes by descending degree.
+    \item Repeatedly picks the highest-degree unassigned node as a clique center.
+    \item Expands the clique greedily: adds neighbors that are adjacent to all current clique members.
+    \item Returns the list of cliques (sets of node indices).
+\end{enumerate}
+
+\begin{lstlisting}
+def greedy_clique_partition(self):
+    cliques = []
+    leftover_nodes = (-self.degrees).argsort().tolist()
+    while leftover_nodes:
+        clique_center, leftover_nodes = leftover_nodes[0], leftover_nodes[1:]
+        clique = {clique_center}
+        neighbors = self.neighbors[clique_center].intersection(leftover_nodes)
+        densest_neighbors = sorted(neighbors, key=lambda x: -self.degrees[x])
+        for neighbor in densest_neighbors:
+            if all([neighbor in self.neighbors[n] for n in clique]):
+                clique.add(neighbor)
+        cliques.append(clique)
+        leftover_nodes = [n for n in leftover_nodes if n not in clique]
+    return cliques
+\end{lstlisting}
+
+\subsubsection{Erd\H{o}s--R\'enyi Random Graph (\texttt{erdos\_renyi})}
+
+\textit{Note: defined in the code but not used by any of the five generators.}
+
+Generates a random graph by including each possible edge $(u,v)$ independently with probability $p$:
+\begin{equation}
+    P\bigl((u,v) \in E\bigr) = p \quad \forall\, u < v.
+\end{equation}
+
+\begin{lstlisting}
+@staticmethod
+def erdos_renyi(number_of_nodes, edge_probability, random):
+    for edge in combinations(np.arange(number_of_nodes), 2):
+        if random.uniform() < edge_probability:
+            # add edge to graph
+\end{lstlisting}
+
+\subsubsection{Barab\'asi--Albert Random Graph (\texttt{barabasi\_albert})}
+
+Used by the Independent Set generator. Implements preferential attachment with affinity $k$:
+
+\begin{enumerate}
+    \item The first $k$ nodes form a star (node 0 connected to nodes $1,\ldots,k-1$).
+    \item Each subsequent node $v$ attaches to $k$ existing nodes sampled without replacement, with attachment probability:
+    \begin{equation}
+        P(\text{attach to }u) = \frac{\deg(u)}{\sum_{w < v} \deg(w)}.
+    \end{equation}
+\end{enumerate}
+
+\begin{lstlisting}
+@staticmethod
+def barabasi_albert(number_of_nodes, affinity, random):
+    for new_node in range(affinity, number_of_nodes):
+        if new_node == affinity:
+            neighborhood = np.arange(new_node)   # star
+        else:
+            neighbor_prob = degrees[:new_node] / (2 * len(edges))
+            neighborhood = random.choice(new_node, affinity,
+                                         replace=False, p=neighbor_prob)
+        # connect new_node to neighborhood
+\end{lstlisting}
+
+% ============================================================
+\subsection{Instance Generator Functions}
+
+\subsubsection{Set Cover (\texttt{generate\_setcover})}
+
+\paragraph{Problem Formulation}
+
+Given $m$ constraints and $n$ binary variables with coverage matrix $A \in \{0,1\}^{m \times n}$ and cost $c \in \mathbb{Z}_{>0}^n$:
+\begin{equation}
+    \min_{x \in \{0,1\}^n}\; c^\top x \quad \text{s.t.}\quad Ax \geq \mathbf{1}.
+\end{equation}
+
+\paragraph{Generation Algorithm (Balas \& Ho, 1980)}
+
+\begin{enumerate}
+    \item Compute target nonzeros: $\mathit{nnz} = \lfloor m \cdot n \cdot \rho \rfloor$.
+    \item Sample $\mathit{nnz}$ column indices randomly; override the first $2n$ with $\{0,\ldots,n{-}1\}$ repeated twice (forces $\geq 2$ rows per column).
+    \item Derive $\mathit{col\_nrows}$: count of row assignments per column.
+    \item Override the first $m$ indices with a random permutation of rows (forces $\geq 1$ column per row).
+    \item Fill remaining column entries by sampling rows without replacement.
+    \item Convert CSC $\to$ CSR sparse matrix; read final row indices.
+    \item Sample $c_j \sim \mathrm{Uniform}\{1,\ldots,c_{\max}\}$.
+\end{enumerate}
+
+\begin{lstlisting}
+def generate_setcover(nrows, ncols, density, filename, rng, max_coef=100):
+    nnzrs = int(nrows * ncols * density)
+    indices = rng.choice(ncols, size=nnzrs)
+    indices[:2*ncols] = np.repeat(np.arange(ncols), 2)   # >= 2 rows/col
+    _, col_nrows = np.unique(indices, return_counts=True)
+    indices[:nrows] = rng.permutation(nrows)              # >= 1 col/row
+    # ... fill remaining indices, build CSC->CSR, write LP
+    c = rng.randint(max_coef, size=ncols) + 1
+\end{lstlisting}
+
+\paragraph{Parameters}
+
+\begin{tabular}{lll}
+\toprule
+Parameter & Train / Valid / Test & Transfer \\
+\midrule
+Rows $m$        & 400  & 500  \\
+Columns $n$     & 750  & 1000 \\
+Density $\rho$  & 0.05 & 0.05 \\
+$c_{\max}$      & 100  & 100  \\
+\bottomrule
+\end{tabular}
+
+% ---
+\subsubsection{Maximum Independent Set (\texttt{generate\_indset})}
+
+\paragraph{Problem Formulation}
+
+\begin{equation}
+    \max_{x \in \{0,1\}^{|V|}}\; \sum_v x_v \quad \text{s.t.}\quad \sum_{v \in C} x_v \leq 1\;\;\forall\,\text{clique } C \in \mathcal{C},
+\end{equation}
+where $\mathcal{C}$ is the greedy clique partition of $G$.
+
+\paragraph{Generation Algorithm}
+
+\begin{enumerate}
+    \item Generate a Barab\'asi--Albert graph $G$ (see Section~2.4).
+    \item Run \texttt{greedy\_clique\_partition} to obtain $\mathcal{C}$ (see Section~2.2).
+    \item Replace all pairwise edge constraints inside each clique with a single clique inequality.
+    \item Add trivial bounds $x_v \leq 1$ for nodes not appearing in any constraint.
+\end{enumerate}
+
+\begin{lstlisting}
+def generate_indset(graph, filename):
+    cliques = graph.greedy_clique_partition()
+    inequalities = set(graph.edges)
+    for clique in cliques:
+        clique = tuple(sorted(clique))
+        for edge in combinations(clique, 2):
+            inequalities.remove(edge)        # remove pairwise
+        if len(clique) > 1:
+            inequalities.add(clique)         # add clique ineq.
+    # add trivial bounds for isolated nodes
+    # write maximize OBJ: sum x_v  s.t. clique inequalities
+\end{lstlisting}
+
+\paragraph{Parameters}
+
+\begin{tabular}{lll}
+\toprule
+Parameter & Train / Valid / Test & Transfer \\
+\midrule
+Nodes $|V|$  & 500 & 1000 \\
+Affinity $k$ & 4   & 4    \\
+\bottomrule
+\end{tabular}
+
+% ---
+\subsubsection{Combinatorial Auctions (\texttt{generate\_cauctions})}
+
+\paragraph{Problem Formulation}
+
+Winner determination over $n_b$ bids with bundles $B_i \subseteq [n]$ and prices $p_i$:
+\begin{equation}
+    \max_{x \in \{0,1\}^{n_b}}\;\sum_i p_i x_i \quad\text{s.t.}\quad \sum_{i:\,j\in B_i} x_i \leq 1\;\;\forall j.
+\end{equation}
+
+\paragraph{Generation Algorithm (Leyton-Brown et al., 2000)}
+
+\begin{enumerate}
+    \item Sample common item resale values $v_j \sim \mathrm{U}(v_{\min}, v_{\max})$.
+    \item Build row-normalized item compatibility matrix $C$ (upper-triangular random, symmetrized).
+    \item For each bidder (repeat until $n_b$ bids placed):
+    \begin{enumerate}
+        \item Draw private interests $\alpha_j \sim \mathrm{U}(0,1)$; private values $\tilde{v}_j = v_j + v_{\max}\,\delta\,(2\alpha_j-1)$.
+        \item Grow a bundle: seed item $\propto \alpha_j$; add items with probability $p_{\text{add}}$, weighted by $\alpha_j \cdot \bar{C}_{\text{bundle},j}$.
+        \item Price: $p = \sum_{j \in B}\tilde{v}_j + |B|^{1+\gamma}$.
+        \item Generate up to $k_{\max}$ substitutable bundles of equal size; filter by budget $\leq \beta_{\text{fac}} \cdot p$ and minimum resale value.
+        \item If $>2$ bids per bidder, add a dummy XOR item.
+    \end{enumerate}
+\end{enumerate}
+
+\begin{lstlisting}
+def generate_cauctions(random, filename, n_items=100, n_bids=500,
+        add_item_prob=0.7, additivity=0.2, budget_factor=1.5, ...):
+    values = min_value + (max_value-min_value) * random.rand(n_items)
+    compats = ...  # row-normalized compatibility matrix
+    while len(bids) < n_bids:
+        # grow bundle, price it, generate substitutable bids
+        price = private_values[bundle].sum() + len(bundle)**(1+additivity)
+        # filter substitutables by budget and resale constraints
+        if len(bidder_bids) > 2:
+            dummy_item = [n_items + n_dummy_items]  # XOR enforcement
+\end{lstlisting}
+
+\paragraph{Parameters}
+
+\begin{tabular}{lll}
+\toprule
+Parameter & Train / Valid / Test & Transfer \\
+\midrule
+Items $n$              & 100  & 200  \\
+Bids $n_b$             & 500  & 1000 \\
+$p_{\text{add}}$       & 0.7  & 0.7  \\
+Additivity $\gamma$    & 0.2  & 0.2  \\
+Budget factor $\beta$  & 1.5  & 1.5  \\
+Resale factor          & 0.5  & 0.5  \\
+Max sub-bids $k_{\max}$& 5    & 5    \\
+\bottomrule
+\end{tabular}
+
+% ---
+\subsubsection{Uncapacitated Facility Location (\texttt{generate\_unsplittable\_capacited\_facility\_location})}
+
+\paragraph{Problem Formulation}
+
+Binary facility opening $y_j$ and assignment $x_{ij}$:
+\begin{align}
+    \min\quad & \sum_{i,j} t_{ij}\,x_{ij} + \sum_j f_j\,y_j \\
+    \text{s.t.}\quad
+    & \sum_j x_{ij} \geq 1 \quad \forall i \quad\text{(demand)}\\
+    & \sum_i d_i\,x_{ij} \leq \mathrm{cap}_j\,y_j \quad \forall j \quad\text{(capacity)}\\
+    & x_{ij} \leq y_j \quad \forall i,j \quad\text{(affectation)}\\
+    & \sum_j \mathrm{cap}_j\,y_j \geq \sum_i d_i \quad\text{(total capacity)}\\
+    & x_{ij},y_j \in \{0,1\}.
+\end{align}
+
+\paragraph{Generation Algorithm}
+
+\begin{enumerate}
+    \item Place $n_c$ customers and $n_f$ facilities uniformly in $[0,1]^2$.
+    \item Sample demands $d_i \sim \mathrm{U}\{5,35\}$ and raw capacities $\mathrm{cap}_j \sim \mathrm{U}\{10,160\}$.
+    \item Scale capacities: $\mathrm{cap}_j \leftarrow \mathrm{cap}_j \cdot r \cdot \frac{\sum_i d_i}{\sum_j \mathrm{cap}_j}$ so that $\sum_j \mathrm{cap}_j = r\,\sum_i d_i$.
+    \item Compute transport costs $t_{ij} = 10\,d_i\,\|c_i - f_j\|_2$.
+    \item Sample fixed costs $f_j \sim \mathrm{U}\{100,110\}\cdot\sqrt{\mathrm{cap}_j} + \mathrm{U}\{0,90\}$.
+\end{enumerate}
+
+\begin{lstlisting}
+def generate_unsplittable_capacited_facility_location(
+        random, filename, n_customers, n_facilities, ratio):
+    # place in [0,1]^2, sample demands and capacities
+    capacities = capacities * ratio * total_demand / total_capacity
+    trans_costs = np.sqrt((c_x-f_x)**2 + (c_y-f_y)**2) * 10 * demands
+    fixed_costs = rng.randint(100,110)*np.sqrt(capacities) + rng.randint(90)
+    # write LP with demand, capacity, affectation, total_capacity constraints
+\end{lstlisting}
+
+\paragraph{Parameters}
+
+\begin{tabular}{lll}
+\toprule
+Parameter & Train / Valid / Test & Transfer \\
+\midrule
+Customers $n_c$    & 35 & 60 \\
+Facilities $n_f$   & 35 & 35 \\
+Capacity ratio $r$ & 5  & 5  \\
+\bottomrule
+\end{tabular}
+
+% ---
+\subsubsection{Multiple Knapsack (\texttt{generate\_mknapsack})}
+
+\paragraph{Problem Formulation}
+
+$x_{ik} = 1$ if item $i$ is placed in knapsack $k$:
+\begin{align}
+    \max\quad & \sum_{k,i} p_i\,x_{ik} \\
+    \text{s.t.}\quad
+    & \sum_i w_i\,x_{ik} \leq \mathrm{cap}_k \quad\forall k \quad\text{(capacity)}\\
+    & \sum_k x_{ik} \leq 1 \quad\forall i \quad\text{(assignment)}\\
+    & x_{ik} \in \{0,1\}.
+\end{align}
+
+\paragraph{Generation Algorithm (Fukunaga, 2011 --- subset-sum scheme)}
+
+\begin{enumerate}
+    \item Sample weights $w_i \sim \mathrm{U}\{w_{\min}, w_{\max}\}$.
+    \item Set $p_i = w_i$ (subset-sum: profits equal weights).
+    \item Sample $\mathrm{cap}_k \sim \mathrm{U}\!\left[\frac{0.4\,\sum w_i}{K},\, \frac{0.6\,\sum w_i}{K}\right]$ for $k = 1,\ldots,K{-}1$.
+    \item Set $\mathrm{cap}_K = 0.5\,\sum_i w_i - \sum_{k<K} \mathrm{cap}_k$.
+\end{enumerate}
+
+\begin{lstlisting}
+def generate_mknapsack(number_of_items, number_of_knapsacks,
+        filename, random, min_range=10, max_range=20, scheme='subset-sum'):
+    weights = random.randint(min_range, max_range, number_of_items)
+    profits = weights   # subset-sum: p_i = w_i
+    capacities[:-1] = random.randint(
+        0.4*weights.sum()//K, 0.6*weights.sum()//K, K-1)
+    capacities[-1] = 0.5*weights.sum() - capacities[:-1].sum()
+\end{lstlisting}
+
+\paragraph{Parameters}
+
+\begin{tabular}{lll}
+\toprule
+Parameter & Train / Valid / Test & Transfer \\
+\midrule
+Items $n$          & 100 & 100 \\
+Knapsacks $K$      & 6   & 12  \\
+$w_{\min}$         & 10  & 10  \\
+$w_{\max}$         & 20  & 20  \\
+Scheme             & subset-sum & subset-sum \\
+\bottomrule
+\end{tabular}
+
+% ============================================================
+\subsection{Seed Validation Helper (\texttt{valid\_seed})}
+
+A small argument type checker used by \texttt{argparse}. Ensures the seed is an integer in $[0,\, 2^{32}-1]$:
+
+\begin{lstlisting}
+def valid_seed(seed):
+    seed = int(seed)
+    if seed < 0 or seed > 2**32 - 1:
+        raise argparse.ArgumentTypeError(
+            "seed must be any integer between 0 and 2**32 - 1 inclusive")
+    return seed
+\end{lstlisting}
+
+% ============================================================
+\subsection{Main Script Block}
+
+\subsubsection{Argument Parsing}
+
+The script accepts two command-line arguments:
+
+\begin{lstlisting}
+python 01_generate_instances.py <problem> [-s SEED]
+# problem: one of {setcover, cauctions, indset, mknapsack, ufacilities}
+# seed:    integer in [0, 2^32-1], default 0
+\end{lstlisting}
+
+\subsubsection{Execution Flow}
+
+\begin{enumerate}
+    \item Create \texttt{rng = numpy.random.RandomState(seed)}.
+    \item Build lists of filenames and parameters for all four splits (train, valid, test, transfer) using \texttt{os.makedirs} for each directory.
+    \item Iterate over the combined filename list in order, calling the appropriate generator function for each file.
+\end{enumerate}
+
+The sequential iteration over all splits means the RNG state advances continuously across split boundaries, so the validation instances are not independent re-draws of the training distribution --- they are simply the next draws in the same sequence.
+
+\subsubsection{Directory Structure Produced}
+
+\begin{lstlisting}
+data/instances/<problem>/
+    train_<params>/     instance_1.lp ... instance_10000.lp
+    valid_<params>/     instance_1.lp ... instance_2000.lp
+    test_<params>/      instance_1.lp ... instance_100.lp
+    transfer_<params>/  instance_1.lp ... instance_100.lp
+\end{lstlisting}
+
+% ============================================================
+\subsection{Reproducibility}
+
+All five generators share the single \texttt{rng} object. The generation order within a run is:
+
+\[
+\underbrace{\text{train}}_{\times 10{,}000} \;\to\;
+\underbrace{\text{valid}}_{\times 2{,}000} \;\to\;
+\underbrace{\text{test}}_{\times 100} \;\to\;
+\underbrace{\text{transfer}}_{\times 100}
+\]
+
+Running the script twice with the same seed produces identical files.
