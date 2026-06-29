@@ -172,7 +172,7 @@ if __name__ == '__main__':
     #args.problem -> type of problem we are using
     #args.mode -> which one -> mdp, tmdp+DFS, tmdp+ObjLim
 
-    brain = Brain(config, device, args.problem, args.mode)
+    brain = Brain(config, device, args.problem, args.mode) 
     agent_pool = AgentPool(brain, config['num_agents'], config['time_limit'], args.mode)
     agent_pool.start()
 
@@ -201,6 +201,7 @@ if __name__ == '__main__':
             # do not do anything with the stats yet, we have to wait for the jobs to finish !
         else:
             logger.info(f"  validation skipped")
+            
         if is_training_epoch(epoch):
             t_samples, t_stats, t_queue, t_access = t_samples_next, t_stats_next, t_queue_next, t_access_next
             t_access.set()

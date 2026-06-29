@@ -51,8 +51,14 @@ class AgentPool():
             policy_access.set()
 
         for instance in instances:
-            task = {'instance': instance, 'sample_rate': sample_rate, 'greedy': greedy,
-                    'samples': samples, 'stats': stats, 'policy_access': policy_access}
+            task = {
+                        'instance': instance,
+                        'sample_rate': sample_rate, 
+                        'greedy': greedy,
+                        'samples': samples, 
+                        'stats': stats, 
+                        'policy_access': policy_access
+                    }
             job_sponsor.put(task)
             self.jobs_queue.put(job_sponsor)
 
@@ -126,11 +132,14 @@ class Agent(threading.Thread):
                      'presolving/maxrestarts': 0,
                      'limits/time': time_limit,
                      'timing/clocktype': 2}
+        
         observation_function=(
             ecole.observation.FocusNode(),
             ecole.observation.NodeBipartite()
             )
+        
         reward_function=ecole.reward.NNodes().cumsum()
+
         information_function={
             'nnodes': ecole.reward.NNodes().cumsum(),
             'lpiters': ecole.reward.LpIterations().cumsum(),
